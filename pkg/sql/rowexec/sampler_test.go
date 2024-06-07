@@ -211,6 +211,167 @@ func TestSampler(t *testing.T) {
 	}
 }
 
+func scoreSampleSize(
+	t *testing.T, rows []rowenc.EncDatumRow, numSamples int, numFrequentVals int,
+) float64 {
+	in := distsqlutils.NewRowBuffer(types.OneIntCol, rows, distsqlutils.RowBufferArgs{})
+	outTypes := []*types.T{
+		types.Int, // original column
+		types.Int, // rank
+		types.Int, // sketch index
+		types.Int, // num rows
+		types.Int, // null vals
+		types.Int, // size
+		types.Bytes,
+	}
+	const (
+		valCol = iota
+		rankCol
+		sketchIndexCol
+		numRowsCol
+	)
+	out := distsqlutils.NewRowBuffer(outTypes, nil, distsqlutils.RowBufferArgs{})
+
+	st := cluster.MakeTestingClusterSettings()
+	evalCtx := eval.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(context.Background())
+	flowCtx := execinfra.FlowCtx{
+		Cfg:     &execinfra.ServerConfig{Settings: st},
+		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
+	}
+
+	spec := &execinfrapb.SamplerSpec{
+		Sketches: []execinfrapb.SketchSpec{
+			{
+				SketchType:        execinfrapb.SketchType_HLL_PLUS_PLUS_V1,
+				Columns:           []uint32{0},
+				GenerateHistogram: true,
+			},
+		},
+		SampleSize: uint32(numSamples),
+	}
+	p, err := newSamplerProcessor(context.Background(), &flowCtx, 0, spec, in, &execinfrapb.PostProcessSpec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Run(context.Background(), out)
+
+	res := make([]int, 0, numSamples)
+	for {
+		row, meta := out.Next()
+		if meta != nil {
+			if meta.SamplerProgress == nil {
+				t.Fatalf("unexpected metadata: %v", meta)
+			}
+			continue
+		} else if row == nil {
+			break
+		}
+
+		if row[valCol].IsNull() {
+			// This is a sketch row.
+			continue
+		}
+		for i := sketchIndexCol; i < len(outTypes); i++ {
+			if i != numRowsCol && !row[i].IsNull() {
+				t.Fatalf("expected NULL on column %d, got %s", i, row[i].Datum)
+			}
+		}
+		v := *row[valCol].Datum.(*tree.DInt)
+		res = append(res, int(v))
+	}
+
+	numFrequentValueInSample := 0
+	seen := make(map[int]bool)
+	for _, v := range res {
+		if v < numFrequentVals {
+			if !seen[v] {
+				numFrequentValueInSample++
+			}
+			seen[v] = true
+		}
+	}
+
+	return float64(numFrequentValueInSample) / float64(numFrequentVals)
+}
+
+func TestSampleSizeVaryingMultiplicities(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	numRows := 100000000
+	numFrequentVals := 3600
+
+	// Change this
+	numSamples := 10000
+
+	rows := make([]rowenc.EncDatumRow, numRows)
+
+	// Fill rows starting at <startIndex> with <number> <count> times
+	fillSlice := func(startIndex int, count int, number int) {
+		for i := 0; i < count; i++ {
+			rows[startIndex+i] = rowenc.EncDatumRow{randgen.IntEncDatum(number)}
+		}
+	}
+
+	// Fill with 2000 different numbers occurring exactly 15,000 times
+	startIndex := 0
+	for i := 0; i < 2000; i++ {
+		fillSlice(startIndex, 15000, i)
+		startIndex += 15000
+	}
+	// Fill with 1000 different numbers occurring exactly 20,000 times
+	for i := 0; i < 1000; i++ {
+		fillSlice(startIndex, 20000, 2000+i)
+		startIndex += 20000
+	}
+	// Fill with 600 different numbers occurring exactly 50,000 times
+	for i := 0; i < 600; i++ {
+		fillSlice(startIndex, 50000, 3000+i)
+		startIndex += 50000
+	}
+	// Fill with 6400 different numbers occurring exactly 3125 times
+	for i := 0; i < 6400; i++ {
+		fillSlice(startIndex, 3125, 3600+i)
+		startIndex += 3125
+	}
+
+	t.Logf("Score: %.8f\n", scoreSampleSize(t, rows, numSamples, numFrequentVals))
+}
+
+func TestSampleSizeUniform(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Change these
+	numRows := 100000000
+	numFrequentVals := 10000
+	numSamples := 20000
+
+	frequentValMultiplicity := numRows / numFrequentVals
+
+	t.Logf("%d rows with %d frequent values each occurring %d times\n\n", numRows, numFrequentVals, frequentValMultiplicity)
+
+	rows := make([]rowenc.EncDatumRow, numRows)
+
+	// Fill rows starting at <startIndex> with <number> <count> times
+	fillSlice := func(startIndex int, count int, number int) {
+		for i := 0; i < count; i++ {
+			rows[startIndex+i] = rowenc.EncDatumRow{randgen.IntEncDatum(number)}
+		}
+	}
+
+	// Fill with <numFrequentVals> different numbers each occurring exactly <frequentValMultiplicity> times
+	startIndex := 0
+	for i := 0; i < numFrequentVals; i++ {
+		fillSlice(startIndex, frequentValMultiplicity, i)
+		startIndex += frequentValMultiplicity
+	}
+
+	t.Logf("Score: %.8f\n", scoreSampleSize(t, rows, numSamples, numFrequentVals))
+}
+
 func TestSamplerMemoryLimit(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
