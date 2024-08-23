@@ -442,7 +442,7 @@ func colsToColList(cols []scopeColumn) opt.ColList {
 	return colList
 }
 
-// resolveAndBuildScalar is used to build a scalar with a required type.
+// resolveAndBuildScalar is used to build a scalar with a required type..
 func (b *Builder) resolveAndBuildScalar(
 	expr tree.Expr,
 	requiredType *types.T,

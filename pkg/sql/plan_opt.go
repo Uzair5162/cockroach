@@ -239,7 +239,7 @@ func (p *planner) prepareUsingOptimizer(
 }
 
 // makeOptimizerPlan generates a plan using the cost-based optimizer.
-// On success, it populates p.curPlan.
+// On success, it populates p.curPlan..
 func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 	ctx, sp := tracing.ChildSpan(ctx, "optimizer")
 	defer sp.Finish()

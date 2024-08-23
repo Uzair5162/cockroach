@@ -83,6 +83,35 @@ func ConstructUsingExtremesSpans(
 	return extremesSpans, nil
 }
 
+// ConstructUsingExtremesSpans returns a constraint.Spans consisting of a
+// lowerbound and upperbound span covering the extremes of an index.
+func ConstructWhereSpans(
+	lowerBound tree.Datum, upperBound tree.Datum, index catalog.Index,
+) (constraint.Spans, error) {
+	var lbSpan constraint.Span
+	var ubSpan constraint.Span
+	if index.GetKeyColumnDirection(0) == catenumpb.IndexColumn_ASC {
+		lbSpan.Init(constraint.EmptyKey, constraint.IncludeBoundary, constraint.MakeKey(lowerBound), constraint.ExcludeBoundary)
+		ubSpan.Init(constraint.MakeKey(upperBound), constraint.ExcludeBoundary, constraint.EmptyKey, constraint.IncludeBoundary)
+	} else {
+		lbSpan.Init(constraint.MakeKey(lowerBound), constraint.ExcludeBoundary, constraint.EmptyKey, constraint.IncludeBoundary)
+		ubSpan.Init(constraint.EmptyKey, constraint.IncludeBoundary, constraint.MakeKey(upperBound), constraint.ExcludeBoundary)
+	}
+	// KV requires that the ranges be in order, so we generate the constraints
+	// differently depending on whether we have an ascending or descending
+	// index.
+	var extremesSpans constraint.Spans
+	if index.GetKeyColumnDirection(0) == catenumpb.IndexColumn_ASC {
+		extremesSpans.InitSingleSpan(&lbSpan)
+		extremesSpans.Append(&ubSpan)
+	} else {
+		extremesSpans.InitSingleSpan(&ubSpan)
+		extremesSpans.Append(&lbSpan)
+	}
+
+	return extremesSpans, nil
+}
+
 // GetUsingExtremesBounds returns a tree.Datum representing the exclusive upper
 // and exclusive lower bounds of the USING EXTREMES span for partial statistics.
 func GetUsingExtremesBounds(

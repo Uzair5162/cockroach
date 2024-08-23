@@ -13,6 +13,7 @@ package sql
 import (
 	"context"
 	"fmt"
+	"reflect"
 
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/optbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -225,9 +227,12 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 
 	// TODO(93998): Add support for WHERE.
 	if n.Options.Where != nil {
-		return nil, pgerror.New(pgcode.FeatureNotSupported,
-			"creating partial statistics with a WHERE clause is not yet supported",
-		)
+		fmt.Println(" GOT WHERE CLAUSE: ", n.Options.Where)
+		fmt.Println(" GOT WHERE STRING: ", n.Options.Where.Expr.String())
+		err = validatePartialStatWhereClause(ctx, n.p, tableDesc, n.Options.Where.Expr)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if err := n.p.CheckPrivilege(ctx, tableDesc, privilege.SELECT); err != nil {
@@ -334,22 +339,29 @@ func (n *createStatsNode) makeJobRecord(ctx context.Context) (*jobs.Record, erro
 		description = statement
 		statement = ""
 	}
+
+	details := jobspb.CreateStatsDetails{
+		Name:             string(n.Name),
+		FQTableName:      fqTableName,
+		Table:            *tableDesc.TableDesc(),
+		ColumnStats:      colStats,
+		Statement:        eventLogStatement,
+		AsOf:             asOfTimestamp,
+		MaxFractionIdle:  n.Options.Throttling,
+		DeleteOtherStats: deleteOtherStats,
+		UsingExtremes:    n.Options.UsingExtremes,
+	}
+
+	if n.Options.Where != nil {
+		details.WhereExpr = n.Options.Where.Expr.String()
+	}
+
 	return &jobs.Record{
 		Description: description,
 		Statements:  []string{statement},
 		Username:    n.p.User(),
-		Details: jobspb.CreateStatsDetails{
-			Name:             string(n.Name),
-			FQTableName:      fqTableName,
-			Table:            *tableDesc.TableDesc(),
-			ColumnStats:      colStats,
-			Statement:        eventLogStatement,
-			AsOf:             asOfTimestamp,
-			MaxFractionIdle:  n.Options.Throttling,
-			DeleteOtherStats: deleteOtherStats,
-			UsingExtremes:    n.Options.UsingExtremes,
-		},
-		Progress: jobspb.CreateStatsProgress{},
+		Details:     details,
+		Progress:    jobspb.CreateStatsProgress{},
 	}, nil
 }
 
@@ -670,6 +682,38 @@ func createStatsDefaultColumns(
 	return colStats, nil
 }
 
+func validatePartialStatWhereClause(
+	ctx context.Context, p *planner, tableDesc catalog.TableDescriptor, whereExpr tree.Expr,
+) error {
+	// Type check the expression.
+	fmt.Println("  WHERE EXPR TYPE: ", reflect.TypeOf(whereExpr))
+	//typedExpr, err := tree.TypeCheck(ctx, whereExpr, p.SemaCtx(), types.Bool)
+	//if err != nil {
+	//	return err
+	//}
+
+	//typedExpr.Eval(evalCtx)
+
+	//d, err := eval.Expr(ctx, p.EvalContext(), typedExpr)
+	//if err != nil {
+	//	return err
+	//}
+	//fmt.Println(" WHERE EXPR: ", d)
+
+	// Check that the expression does not reference any columns not in the table.
+	colIDs, err := schemaexpr.ExtractColumnIDs(tableDesc, whereExpr)
+	if err != nil {
+		return err
+	}
+	fmt.Println("  WHERE EXPR COL IDS: ", colIDs)
+	//for _, colID := range colIDs.Ordered() {
+	//	if _, err := tableDesc.FindColumnWithID(colID); err != nil {
+	//		return pgerror.Newf(pgcode.UndefinedColumn, "column %d does not exist", colID)
+	//	}
+	//}
+	return nil
+}
+
 // createStatsResumer implements the jobs.Resumer interface for CreateStats
 // jobs. A new instance is created for each job.
 type createStatsResumer struct {
@@ -742,11 +786,35 @@ func (r *createStatsResumer) Resume(ctx context.Context, execCtx interface{}) er
 				}
 			}
 		} else {
-			planCtx := dsp.NewPlanningCtx(ctx, innerEvalCtx, innerP, txn.KV(), FullDistribution)
-			err = dsp.planAndRunCreateStats(
-				ctx, innerEvalCtx, planCtx, innerP.SemaCtx(), txn.KV(), resultWriter, r.job.ID(), details,
-				1 /* numIndexes */, 0, /* curIndex */
-			)
+			if details.WhereExpr != "" {
+				wherePlanner, whereCleanup := NewInternalPlanner(
+					"create-stats-resume-job",
+					txn.KV(),
+					jobsPlanner.User(),
+					&MemoryMetrics{},
+					jobsPlanner.ExecCfg(),
+					jobsPlanner.SessionData(),
+				)
+				defer whereCleanup()
+
+				whereP := wherePlanner.(*planner)
+				opc := &whereP.optPlanningCtx
+				f := opc.optimizer.Factory()
+
+				whereExpr, err := parser.ParseExpr(details.WhereExpr)
+				if err != nil {
+					return err
+				}
+
+				bld := optbuilder.New(ctx, &whereP.semaCtx, whereP.EvalContext(), opc.catalog, f, whereExpr)
+				whereScope := bld.Build()
+			} else {
+				planCtx := dsp.NewPlanningCtx(ctx, innerEvalCtx, innerP, txn.KV(), FullDistribution)
+				err = dsp.planAndRunCreateStats(
+					ctx, innerEvalCtx, planCtx, innerP.SemaCtx(), txn.KV(), resultWriter, r.job.ID(), details,
+					1 /* numIndexes */, 0, /* curIndex */
+				)
+			}
 		}
 
 		if err != nil {

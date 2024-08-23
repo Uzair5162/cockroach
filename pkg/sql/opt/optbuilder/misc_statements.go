@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -154,6 +155,54 @@ func (b *Builder) buildCreateStatistics(n *tree.CreateStats, inScope *scope) (ou
 	if n.Options.AsOf.Expr == nil {
 		n.Options.AsOf.Expr = tree.NewStrVal("-1us")
 	}
+
+	//whereScope.addColumn(scopeColName(tree.Name(n.ColumnNames[0].String())))
+
+	//whereScope.cols = append(whereScope.cols, scopeColumn{
+	//	name: scopeColName(tree.Name(n.ColumnNames[0].String())),
+	//	typ:  ,
+	//	id:   col.id,
+	//})
+	//var condition opt.ScalarExpr
+	//b.factory.FoldingControl().TemporarilyDisallowStableFolds(func() {
+	//	condition = b.buildScalar(texpr, tableScope, nil, nil, nil)
+	//})
+
+	var whereConstraint *constraint.Constraint
+	if n.Options.Where != nil {
+		whereScope := b.allocScope()
+
+		fmt.Println("    table: ", n.Table)
+		whereScope = b.buildDataSource(n.Table, nil, noLocking, whereScope)
+
+		texpr := whereScope.resolveAndRequireType(n.Options.Where.Expr, types.Bool)
+
+		condition := b.buildScalar(texpr, whereScope, nil, nil, nil)
+
+		constraints, tightConstraints := memo.BuildConstraints(b.ctx, condition, b.factory.Metadata(), b.evalCtx, true)
+
+		if !tightConstraints {
+			// We can't build statistics on a table with a loose constraint.
+			panic("loose constraint")
+		}
+
+		if constraints.Length() != 1 {
+			// We can't build statistics on a table with multiple constraints.
+			panic("multiple constraints")
+		}
+
+		whereConstraint = constraints.Constraint(0)
+		fmt.Println("		constraint: ", whereConstraint)
+
+		//whereScope := inScope.push()
+		fmt.Println("    type checking: ", n.Options.Where.Expr)
+
+		//b.buildWhere(n.Options.Where, inScope)
+
+		//whereExpr := b.buildScalar(typedExpr, outScope, nil /* outScope */, nil /* outCol */, nil /* colRefs */)
+		//fmt.Println("    whereExpr: ", whereExpr)
+	}
+	//b.buildWhere(outScope, n.Options.Where, nil /* orderBy */, nil /* limit */
 
 	outScope.expr = b.factory.ConstructCreateStatistics(&memo.CreateStatisticsPrivate{
 		Syntax: n,

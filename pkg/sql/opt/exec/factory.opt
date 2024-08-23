@@ -748,6 +748,7 @@ define CancelSessions {
 }
 
 # CreateStatistics implements CREATE STATISTICS.
+# WhereConstraint *constraint.Constraint
 define CreateStatistics {
     Cs *tree.CreateStats
 }

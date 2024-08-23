@@ -12,6 +12,7 @@ package sql
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"time"
 
@@ -277,6 +278,202 @@ func (dsp *DistSQLPlanner) createAndAttachSamplers(
 	)
 	p.PlanToStreamColMap = []int{}
 	return p
+}
+
+func (dsp *DistSQLPlanner) createPartialStatsPlanWhere(
+	ctx context.Context,
+	planCtx *PlanningCtx,
+	semaCtx *tree.SemaContext,
+	desc catalog.TableDescriptor,
+	reqStats []requestedStat,
+	jobID jobspb.JobID,
+	details jobspb.CreateStatsDetails,
+	numIndexes int,
+	curIndex int,
+) (*PhysicalPlan, error) {
+	whereExpr, err := parser.ParseExpr(details.WhereExpr)
+
+	if err != nil {
+		return nil, err
+	}
+	fmt.Println("  parsed expr:", whereExpr)
+
+	// Partial stats collections on multiple columns create different plans,
+	// so we only support one requested stat at a time here.
+	if len(reqStats) > 1 {
+		return nil, unimplemented.NewWithIssue(
+			128904,
+			"cannot process multiple partial statistics requests at once",
+		)
+	}
+
+	reqStat := reqStats[0]
+
+	if len(reqStat.columns) > 1 {
+		// TODO (faizaanmadhani): Add support for creating multi-column stats
+		return nil, pgerror.Newf(pgcode.FeatureNotSupported, "multi-column partial statistics are not currently supported")
+	}
+
+	// Fetch all stats for the table that matches the given table descriptor.
+	tableStats, err := planCtx.ExtendedEvalCtx.ExecCfg.TableStatsCache.GetTableStats(ctx, desc)
+	if err != nil {
+		return nil, err
+	}
+
+	column, err := catalog.MustFindColumnByID(desc, reqStat.columns[0])
+	if err != nil {
+		return nil, err
+	}
+
+	// Calculate the column we need to scan
+	// TODO (faizaanmadhani): Iterate through all columns in a requested stat when
+	// when we add support for multi-column statistics.
+	var colCfg scanColumnsConfig
+	colCfg.wantedColumns = append(colCfg.wantedColumns, column.GetID())
+
+	// Initialize a dummy scanNode for the requested statistic.
+	scan := scanNode{desc: desc}
+	err = scan.initDescSpecificCol(colCfg, column)
+	if err != nil {
+		return nil, err
+	}
+	// Map the ColumnIDs to their ordinals in scan.cols
+	// This loop should only iterate once, since we only
+	// handle single column partial statistics.
+	// TODO(faizaanmadhani): Add support for multi-column partial stats next
+	var colIdxMap catalog.TableColMap
+	for i, c := range scan.cols {
+		colIdxMap.Set(c.GetID(), i)
+	}
+
+	var sb span.Builder
+	sb.Init(planCtx.EvalContext(), planCtx.ExtendedEvalCtx.Codec, desc, scan.index)
+
+	var stat *stats.TableStatistic
+	var histogram []cat.HistogramBucket
+	// Find the statistic and histogram from the newest table statistic for our
+	// column that is not partial and not forecasted. The first one we find will
+	// be the latest due to the newest to oldest ordering property of the cache.
+	for _, t := range tableStats {
+		if len(t.ColumnIDs) == 1 && column.GetID() == t.ColumnIDs[0] &&
+			!t.IsPartial() && !t.IsMerged() && !t.IsForecast() {
+			if t.HistogramData == nil || t.HistogramData.ColumnType == nil || len(t.Histogram) == 0 {
+				return nil, pgerror.Newf(
+					pgcode.ObjectNotInPrerequisiteState,
+					"the latest full statistic for column %s has no histogram",
+					column.GetName(),
+				)
+			}
+			if colinfo.ColumnTypeIsInvertedIndexable(column.GetType()) &&
+				t.HistogramData.ColumnType.Family() == types.BytesFamily {
+				return nil, pgerror.Newf(
+					pgcode.ObjectNotInPrerequisiteState,
+					"the latest full statistic histogram for column %s is an inverted index histogram",
+					column.GetName(),
+				)
+			}
+			stat = t
+			histogram = t.Histogram
+			break
+		}
+	}
+	if stat == nil {
+		return nil, pgerror.Newf(
+			pgcode.ObjectNotInPrerequisiteState,
+			"column %s does not have a prior statistic",
+			column.GetName())
+	}
+	//scalarExpr :=
+	//constraints, tightConstraints := memo.BuildConstraints(ctx, whereExpr, semaCtx, planCtx.EvalContext())
+
+	lowerBound, upperBound, err := bounds.GetUsingExtremesBounds(ctx, planCtx.EvalContext(), histogram)
+	if err != nil {
+		return nil, err
+	}
+	extremesSpans, err := bounds.ConstructUsingExtremesSpans(lowerBound, upperBound, scan.index)
+	if err != nil {
+		return nil, err
+	}
+	extremesPredicate := bounds.ConstructUsingExtremesPredicate(lowerBound, upperBound, column.GetName())
+	// Get roachpb.Spans from constraint.Spans
+	scan.spans, err = sb.SpansFromConstraintSpan(&extremesSpans, span.NoopSplitter())
+	if err != nil {
+		return nil, err
+	}
+	p, err := dsp.createTableReaders(ctx, planCtx, &scan)
+	if err != nil {
+		return nil, err
+	}
+	if details.AsOf != nil {
+		val := maxTimestampAge.Get(&dsp.st.SV)
+		for i := range p.Processors {
+			spec := p.Processors[i].Spec.Core.TableReader
+			spec.MaxTimestampAgeNanos = uint64(val)
+		}
+	}
+
+	sampledColumnIDs := make([]descpb.ColumnID, len(scan.cols))
+	spec := execinfrapb.SketchSpec{
+		SketchType:          execinfrapb.SketchType_HLL_PLUS_PLUS_V1,
+		GenerateHistogram:   reqStat.histogram,
+		HistogramMaxBuckets: reqStat.histogramMaxBuckets,
+		Columns:             make([]uint32, len(reqStat.columns)),
+		StatName:            reqStat.name,
+		PartialPredicate:    extremesPredicate,
+		FullStatisticID:     stat.StatisticID,
+		PrevLowerBound:      tree.Serialize(lowerBound),
+	}
+	// For now, this loop should iterate only once, as we only
+	// handle single-column partial statistics.
+	// TODO(faizaanmadhani): Add support for multi-column partial stats next
+	for i, colID := range reqStat.columns {
+		colIdx, ok := colIdxMap.Get(colID)
+		if !ok {
+			panic("necessary column not scanned")
+		}
+		streamColIdx := uint32(p.PlanToStreamColMap[colIdx])
+		spec.Columns[i] = streamColIdx
+		sampledColumnIDs[streamColIdx] = colID
+	}
+	var sketchSpec, invSketchSpec []execinfrapb.SketchSpec
+	if reqStat.inverted {
+		// Find the first inverted index on the first column for collecting
+		// histograms. Although there may be more than one index, we don't
+		// currently have a way of using more than one or deciding which one
+		// is better.
+		//
+		// We do not generate multi-column stats with histograms, so there
+		// is no need to find an index for multi-column stats here.
+		//
+		// TODO(mjibson): allow multiple inverted indexes on the same column
+		// (i.e., with different configurations). See #50655.
+		if len(reqStat.columns) == 1 {
+			for _, index := range desc.PublicNonPrimaryIndexes() {
+				if index.GetType() == descpb.IndexDescriptor_INVERTED && index.InvertedColumnID() == column.GetID() {
+					spec.Index = index.IndexDesc()
+					break
+				}
+			}
+		}
+		// Even if spec.Index is nil because there isn't an inverted index
+		// on the requested stats column, we can still proceed. We aren't
+		// generating histograms in that case so we don't need an index
+		// descriptor to generate the inverted index entries.
+		invSketchSpec = append(invSketchSpec, spec)
+	} else {
+		sketchSpec = append(sketchSpec, spec)
+	}
+	return dsp.createAndAttachSamplers(
+		ctx,
+		p,
+		desc,
+		tableStats,
+		details,
+		sampledColumnIDs,
+		jobID,
+		reqStats,
+		sketchSpec, invSketchSpec,
+		numIndexes, curIndex), nil
 }
 
 func (dsp *DistSQLPlanner) createPartialStatsPlan(
@@ -738,7 +935,9 @@ func (dsp *DistSQLPlanner) createPlanForCreateStats(
 		return nil, errors.New("no stats requested")
 	}
 
-	if details.UsingExtremes {
+	if details.WhereExpr != "" {
+		return dsp.createPartialStatsPlanWhere(ctx, planCtx, semaCtx, tableDesc, reqStats, jobID, details, numIndexes, curIndex)
+	} else if details.UsingExtremes {
 		return dsp.createPartialStatsPlan(ctx, planCtx, tableDesc, reqStats, jobID, details, numIndexes, curIndex)
 	}
 	return dsp.createStatsPlan(ctx, planCtx, semaCtx, tableDesc, reqStats, jobID, details, numIndexes, curIndex)
